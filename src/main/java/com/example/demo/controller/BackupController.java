@@ -50,11 +50,11 @@ public class BackupController {
     }
 
     @PostMapping("/classify")
-    public ResponseResult<BackupTask> classifyData(@RequestBody PathDTO pathDTO) {
+    public ResponseResult<Map<String, Object>> classifyData(@RequestBody PathDTO pathDTO) {
         String sourcePath = pathDTO.getSourcePath();
         try {
-            BackupTask classifiedTask = classificationService.classifyData(sourcePath);
-            return ResponseResult.success(classifiedTask, "数据分类成功");
+            Map<String, Object> result = classificationService.classifyData(sourcePath);
+            return ResponseResult.success(result, "数据分类成功");
         } catch (Exception e) {
             log.error("分类失败: sourcePath={}", sourcePath, e);
             return ResponseResult.fail("分类失败：" + e.getMessage());

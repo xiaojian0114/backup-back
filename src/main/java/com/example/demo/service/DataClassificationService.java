@@ -3,20 +3,23 @@ package com.example.demo.service;
 import com.example.demo.controller.ConfigController;
 import com.example.demo.entity.BackupTask;
 import com.example.demo.entity.Config;
-import com.example.demo.entity.HardDisk;
 import com.example.demo.repository.BackupTaskRepository;
 import com.example.demo.repository.ConfigRepository;
 import com.example.demo.repository.HardDiskRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 @Service
@@ -30,80 +33,105 @@ public class DataClassificationService {
     @Autowired
     private HardDiskRepository hardDiskRepository;
 
+    private static final long COLD_DATA_THRESHOLD_DAYS = 365;
 
-    public BackupTask classifyData(String sourcePath) throws Exception {
+    public Map<String, Object> classifyData(String sourcePath) throws Exception {
         Path path = Paths.get(sourcePath);
-        // 校验路径是否存在
         if (!Files.exists(path)) {
             throw new IllegalArgumentException("路径不存在：" + sourcePath);
         }
 
-        // 1. 获取文件最后访问时间
-        BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
-        LocalDateTime fileLastAccessTime = LocalDateTime.ofInstant(
-                attrs.lastAccessTime().toInstant(),
-                ZoneId.systemDefault()
-        );
-
-        // 2. 获取配置的时间阈值（冷数据判断标准）
-        Config accessTimeConfig = configRepository.findByConfigKey(ConfigController.LAST_FILE_ACCESS_TIME);
-        if (accessTimeConfig == null) {
-            throw new RuntimeException("未配置文件访问时间阈值，请先初始化配置");
-        }
-        LocalDateTime coldDataThreshold = LocalDateTime.parse(
-                accessTimeConfig.getConfigValue(),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-        );
-
-        // 判断是否为冷数据（文件访问时间早于阈值）
-        boolean isColdData = fileLastAccessTime.isBefore(coldDataThreshold);
-
-
-        // 3. 判断是否为敏感数据
+        // 获取敏感词配置
         Config sensitiveConfig = configRepository.findByConfigKey(ConfigController.SENSITIVE_KEYWORDS);
-        boolean isSensitive = sensitiveConfig != null && Pattern.compile(sensitiveConfig.getConfigValue())
-                .matcher(path.getFileName().toString()).find();
+        String sensitivePattern = sensitiveConfig != null ? sensitiveConfig.getConfigValue() : null;
+        if (sensitivePattern == null || sensitivePattern.trim().isEmpty()) {
+            throw new IllegalStateException("敏感词配置未找到或为空，请检查 config 表中的 " + ConfigController.SENSITIVE_KEYWORDS);
+        }
 
-
-        // 4. 创建并保存备份任务
+        // 创建备份任务
         BackupTask task = new BackupTask();
         task.setSourcePath(sourcePath);
-        task.setSchedule("0 0 0 * * ?"); // 每日凌晨执行
+        task.setSchedule(""); // 不设置自动调度
         task.setBackupMode("COPY");
-        task.setStatus(isColdData ? "COLD" : "HOT");
-        task.setSensitive(isSensitive);
-        task.setBackupCount(isSensitive ? 2 : 1); // 敏感文件备份2份
+        task.setStatus("PENDING");
+        task.setSensitive(false); // 默认非敏感，具体由文件分类确定
+        task.setPaused(false);
+
+        // 分类文件
+        List<Map<String, Object>> fileClassifications = new ArrayList<>();
+        if (path.toFile().isDirectory()) {
+            Files.walk(path)
+                    .filter(Files::isRegularFile)
+                    .forEach(filePath -> {
+                        try {
+                            fileClassifications.add(classifySingleFile(filePath, sensitivePattern));
+                        } catch (Exception e) {
+                            Map<String, Object> errorClassification = new HashMap<>();
+                            errorClassification.put("filePath", filePath.toString());
+                            errorClassification.put("backupCount", 0);
+                            errorClassification.put("reason", "分类失败: " + e.getMessage());
+                            fileClassifications.add(errorClassification);
+                        }
+                    });
+        } else {
+            fileClassifications.add(classifySingleFile(path, sensitivePattern));
+        }
+
+        // 计算总备份次数和大小
+        int totalBackupCount = fileClassifications.stream()
+                .mapToInt(classification -> (int) classification.get("backupCount"))
+                .sum();
+        long totalSize = fileClassifications.stream()
+                .filter(classification -> (int) classification.get("backupCount") > 0)
+                .mapToLong(classification -> {
+                    try {
+                        return Files.size(Paths.get((String) classification.get("filePath")));
+                    } catch (Exception e) {
+                        return 0L;
+                    }
+                })
+                .sum() * totalBackupCount;
+
+        task.setBackupCount(totalBackupCount);
+        task.setTotalSize(totalSize);
         taskRepository.save(task);
 
-
-        // 5. 冷数据自动触发备份
-        if (isColdData) {
-            HardDisk targetDisk = selectAvailableDisk(path.toFile().length() * task.getBackupCount());
-            if (targetDisk == null) {
-                throw new IllegalStateException("没有可用磁盘满足备份容量要求");
-            }
-            backupService.executeBackup(task, targetDisk);
-        }
-
-        return task;
+        // 返回分类结果
+        Map<String, Object> result = new HashMap<>();
+        result.put("task", task);
+        result.put("fileClassifications", fileClassifications);
+        return result;
     }
 
+    private Map<String, Object> classifySingleFile(Path file, String sensitivePattern) throws Exception {
+        Map<String, Object> classification = new HashMap<>();
+        classification.put("filePath", file.toString());
 
-    // 选择可用磁盘（满足容量要求）
-    private HardDisk selectAvailableDisk(long requiredSpace) {
-        Config thresholdConfig = configRepository.findByConfigKey(ConfigController.MIGRATION_THRESHOLD);
-        long migrationThreshold = thresholdConfig != null ?
-                Long.parseLong(thresholdConfig.getConfigValue()) :
-                50L * 1024 * 1024 * 1024; // 默认50GB
-
-        // 筛选可用磁盘（状态正常、容量足够）
-        for (HardDisk disk : hardDiskRepository.findAll()) {
-            if ("ACTIVE".equals(disk.getStatus())
-                    && disk.getAvailableCapacity() >= requiredSpace
-                    && disk.getAvailableCapacity() >= migrationThreshold) {
-                return disk;
-            }
+        // 检查敏感词
+        boolean isSensitive = Pattern.compile(sensitivePattern).matcher(file.getFileName().toString()).find();
+        if (isSensitive) {
+            classification.put("backupCount", 2);
+            classification.put("reason", "Sensitive");
+            return classification;
         }
-        return null;
+
+        // 检查冷数据
+        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+        LocalDateTime lastModified = LocalDateTime.ofInstant(
+                attrs.lastModifiedTime().toInstant(),
+                java.time.ZoneId.systemDefault()
+        );
+        long daysSinceModified = ChronoUnit.DAYS.between(lastModified, LocalDateTime.now());
+        if (daysSinceModified > COLD_DATA_THRESHOLD_DAYS) {
+            classification.put("backupCount", 1);
+            classification.put("reason", "Cold Data");
+            classification.put("lastModified", lastModified.toString());
+            return classification;
+        }
+
+        classification.put("backupCount", 0);
+        classification.put("reason", "Normal");
+        classification.put("lastModified", lastModified.toString());
+        return classification;
     }
 }

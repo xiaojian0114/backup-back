@@ -17,8 +17,10 @@ import org.springframework.stereotype.Service;
 
 import java.io.*;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -39,6 +41,7 @@ public class BackupService {
     private static final boolean IS_WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
     private static final long PROGRESS_PUSH_THRESHOLD = 100 * 1024 * 1024; // 每100MB推送进度
     private static final long PAUSE_CHECK_INTERVAL = 1000; // 每秒检查暂停状态
+    private static final long COLD_DATA_THRESHOLD_DAYS = 365; // 冷数据阈值：365天
 
     private long getMigrationThreshold() {
         Config thresholdConfig = configRepository.findByConfigKey("migration_threshold");
@@ -54,45 +57,53 @@ public class BackupService {
         task.setPaused(false);
         task.setTargetDiskId(targetDisk.getDiskId());
         long totalSize = sourceFile.isDirectory() ? calculateFolderSize(sourceFile) : sourceFile.length();
-        task.setTotalSize(totalSize * task.getBackupCount());
+        task.setTotalSize(totalSize); // 初始总大小，稍后根据分类调整
         task.setCompletedSize(0L);
         taskRepository.save(task);
 
-        boolean isCaseFolder = isCaseFolder(sourceFile);
         Config sensitiveConfig = configRepository.findByConfigKey("sensitive_keywords");
-        boolean isSensitive = sensitiveConfig != null && Pattern.compile(sensitiveConfig.getConfigValue()).matcher(sourceFile.getName()).find();
-        if (isSensitive) {
-            task.setSensitive(true);
-            task.setBackupCount(2);
-            task.setTotalSize(totalSize * 2);
-            taskRepository.save(task);
-        }
+        String sensitivePattern = sensitiveConfig != null ? sensitiveConfig.getConfigValue() : null;
 
-        long requiredSpace = task.getTotalSize();
-        if (targetDisk.getAvailableCapacity() < requiredSpace || targetDisk.getAvailableCapacity() < getMigrationThreshold()) {
-            task.setStatus("FAILED");
-            taskRepository.save(task);
-            throw new IllegalStateException("目标磁盘容量不足");
-        }
+        List<String> failedFiles = new ArrayList<>();
+        long actualUsedSpace = 0;
 
-        String checksum = null;
-        if (!sourceFile.isDirectory()) {
-            checksum = ChecksumUtil.calculateSHA256(sourceFile);
-            if (!isSensitive && logRepository.findByChecksum(checksum) != null) {
+        if (sourceFile.isDirectory()) {
+            actualUsedSpace = backupFolder(sourceFile, task, targetDisk, sensitivePattern, failedFiles);
+        } else {
+            // 对单个文件进行分类
+            int backupCount = classifyFile(sourceFile, sensitivePattern);
+            task.setBackupCount(backupCount);
+            task.setTotalSize(totalSize * backupCount);
+            taskRepository.save(task);
+
+            if (backupCount == 0) {
+                log("文件无需备份: " + sourceFile.getName());
+                task.setStatus("COMPLETED");
+                task.setCompletedSize(0L);
+                taskRepository.save(task);
+                return;
+            }
+
+            // 检查目标磁盘空间
+            long requiredSpace = task.getTotalSize();
+            if (targetDisk.getAvailableCapacity() < requiredSpace || targetDisk.getAvailableCapacity() < getMigrationThreshold()) {
+                task.setStatus("FAILED");
+                taskRepository.save(task);
+                throw new IllegalStateException("目标磁盘容量不足");
+            }
+
+            String checksum = ChecksumUtil.calculateSHA256(sourceFile);
+            if (backupCount == 1 && logRepository.findByChecksum(checksum) != null) {
+                log("文件已备份，跳过: " + sourceFile.getName());
                 task.setStatus("COMPLETED");
                 task.setCompletedSize(totalSize);
                 taskRepository.save(task);
                 return;
             }
-        }
 
-        List<String> failedFiles = new ArrayList<>();
-        long actualUsedSpace = 0;
-        try {
-            if (sourceFile.isDirectory()) {
-                actualUsedSpace = backupFolder(sourceFile, task, targetDisk, isCaseFolder, failedFiles);
-            } else {
-                for (int i = 1; i <= task.getBackupCount(); i++) {
+            // 执行文件备份
+            try {
+                for (int i = 1; i <= backupCount; i++) {
                     if (task.isPaused()) {
                         handlePause(task);
                         return;
@@ -106,30 +117,48 @@ public class BackupService {
                     task.setCompletedSize(task.getCompletedSize() + sourceFile.length());
                     taskRepository.save(task);
                 }
+            } catch (Exception e) {
+                failedFiles.add(sourceFile.getAbsolutePath() + ": " + e.getMessage());
             }
+        }
 
-            if (!failedFiles.isEmpty()) {
-                task.setStatus("PARTIALLY_FAILED");
-                taskRepository.save(task);
-                throw new Exception("部分文件备份失败: " + String.join(", ", failedFiles));
-            }
+        if (!failedFiles.isEmpty()) {
+            task.setStatus("PARTIALLY_FAILED");
+            taskRepository.save(task);
+            throw new Exception("部分文件备份失败: " + String.join(", ", failedFiles));
+        }
 
+        if (actualUsedSpace > 0) {
             targetDisk.setAvailableCapacity(targetDisk.getAvailableCapacity() - actualUsedSpace);
             diskRepository.save(targetDisk);
             generateIndex(task.getId());
-            task.setStatus("COMPLETED");
-            task.setCompletedSize(task.getTotalSize());
-            taskRepository.save(task);
-        } catch (Exception e) {
-            if (!task.getStatus().equals("PAUSED") && !task.getStatus().equals("CANCELED")) {
-                task.setStatus("FAILED");
-                taskRepository.save(task);
-            }
-            throw e;
         }
+
+        task.setStatus("COMPLETED");
+        task.setCompletedSize(task.getTotalSize());
+        taskRepository.save(task);
     }
 
-    private long backupFolder(File sourceFolder, BackupTask task, HardDisk disk, boolean isCaseFolder, List<String> failedFiles) throws Exception {
+    private int classifyFile(File file, String sensitivePattern) throws IOException {
+        boolean isSensitive = sensitivePattern != null && Pattern.compile(sensitivePattern).matcher(file.getName()).find();
+        if (isSensitive) {
+            log("文件包含敏感词: " + file.getName());
+            return 2; // 敏感文件备份两次
+        }
+
+        BasicFileAttributes attrs = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+        LocalDateTime lastModified = LocalDateTime.ofInstant(attrs.lastModifiedTime().toInstant(), java.time.ZoneId.systemDefault());
+        long daysSinceModified = ChronoUnit.DAYS.between(lastModified, LocalDateTime.now());
+        if (daysSinceModified > COLD_DATA_THRESHOLD_DAYS) {
+            log("文件为冷数据: " + file.getName() + "，上次修改于: " + lastModified);
+            return 1; // 冷数据备份一次
+        }
+
+        log("文件无需备份: " + file.getName());
+        return 0; // 其他情况不备份
+    }
+
+    private long backupFolder(File sourceFolder, BackupTask task, HardDisk disk, String sensitivePattern, List<String> failedFiles) throws Exception {
         Path sourcePath = sourceFolder.toPath();
         Path targetBasePath = Paths.get(disk.getMountPoint(), sourceFolder.getName());
         log("【文件夹备份】源文件夹: " + sourcePath.toAbsolutePath() + "，目标根路径: " + targetBasePath.toAbsolutePath());
@@ -137,6 +166,29 @@ public class BackupService {
         long actualUsedSpace = 0;
         Files.createDirectories(targetBasePath);
         List<Path> paths = Files.walk(sourcePath).collect(Collectors.toList());
+
+        // 计算总备份大小并设置备份次数
+        long totalSize = 0;
+        Map<Path, Integer> fileBackupCounts = new HashMap<>();
+        for (Path source : paths) {
+            if (Files.isRegularFile(source)) {
+                int backupCount = classifyFile(source.toFile(), sensitivePattern);
+                fileBackupCounts.put(source, backupCount);
+                totalSize += source.toFile().length() * backupCount;
+            }
+        }
+        task.setTotalSize(totalSize);
+        task.setBackupCount(fileBackupCounts.values().stream().mapToInt(Integer::intValue).sum());
+        taskRepository.save(task);
+
+        // 检查目标磁盘空间
+        if (disk.getAvailableCapacity() < totalSize || disk.getAvailableCapacity() < getMigrationThreshold()) {
+            task.setStatus("FAILED");
+            taskRepository.save(task);
+            throw new IllegalStateException("目标磁盘容量不足");
+        }
+
+        // 备份文件夹内容
         for (Path source : paths) {
             if (task.isPaused()) {
                 handlePause(task);
@@ -148,49 +200,29 @@ public class BackupService {
                     Files.createDirectories(target);
                     log("【文件夹创建】已创建目录: " + target.toAbsolutePath());
                 } else {
+                    int backupCount = fileBackupCounts.getOrDefault(source, 0);
+                    if (backupCount == 0) {
+                        log("【跳过备份】文件: " + source.getFileName());
+                        continue;
+                    }
                     String fileChecksum = ChecksumUtil.calculateSHA256(source.toFile());
-                    if (!task.getSensitive() && logRepository.findByChecksum(fileChecksum) != null) {
+                    if (backupCount == 1 && logRepository.findByChecksum(fileChecksum) != null) {
                         log("【去重跳过】文件已备份，跳过: " + source.getFileName() + "，校验和: " + fileChecksum);
                         continue;
                     }
-                    actualUsedSpace += backupFile(source.toFile(), target.toString(), task, disk, fileChecksum, 1);
-                    task.setCompletedSize(task.getCompletedSize() + source.toFile().length());
-                    taskRepository.save(task);
+                    for (int i = 1; i <= backupCount; i++) {
+                        String targetPath = backupCount > 1 && i > 1 ?
+                                target.toString() + "_copy" + i : target.toString();
+                        actualUsedSpace += backupFile(source.toFile(), targetPath, task, disk, fileChecksum, i);
+                        task.setCompletedSize(task.getCompletedSize() + source.toFile().length());
+                        taskRepository.save(task);
+                    }
                 }
             } catch (Exception e) {
                 String errorMsg = "文件夹备份失败，文件: " + source.toAbsolutePath() + "，错误: " + e.getMessage();
                 logError("【文件夹备份失败】" + errorMsg);
                 failedFiles.add(errorMsg);
                 pushFailureBreakpoint(source.toFile(), task, disk, e.getMessage());
-            }
-        }
-
-        if (task.getSensitive()) {
-            Path copyPath = Paths.get(disk.getMountPoint(), sourceFolder.getName() + "_copy2");
-            log("【敏感文件备份】开始额外备份到: " + copyPath.toAbsolutePath());
-            Files.createDirectories(copyPath);
-            for (Path source : paths) {
-                if (task.isPaused()) {
-                    handlePause(task);
-                    return actualUsedSpace;
-                }
-                try {
-                    Path target = copyPath.resolve(sourcePath.relativize(source));
-                    if (Files.isDirectory(source)) {
-                        Files.createDirectories(target);
-                        log("【文件夹创建】已创建目录: " + target.toAbsolutePath());
-                    } else {
-                        String fileChecksum = ChecksumUtil.calculateSHA256(source.toFile());
-                        actualUsedSpace += backupFile(source.toFile(), target.toString(), task, disk, fileChecksum, 2);
-                        task.setCompletedSize(task.getCompletedSize() + source.toFile().length());
-                        taskRepository.save(task);
-                    }
-                } catch (Exception e) {
-                    String errorMsg = "敏感文件额外备份失败，文件: " + source.toAbsolutePath() + "，错误: " + e.getMessage();
-                    logError("【敏感备份失败】" + errorMsg);
-                    failedFiles.add(errorMsg);
-                    pushFailureBreakpoint(source.toFile(), task, disk, e.getMessage());
-                }
             }
         }
         return actualUsedSpace;
@@ -389,20 +421,6 @@ public class BackupService {
         if (sourceFile.isDirectory() && !sourceFile.canExecute()) {
             throw new SecurityException("源目录不可访问: " + sourceFile.getAbsolutePath());
         }
-    }
-
-    private boolean isCaseFolder(File file) {
-        if (!file.isDirectory()) {
-            return false;
-        }
-        String[] caseSubfolders = {"镜像", "录屏", "截图", "数据报告"};
-        for (String subfolder : caseSubfolders) {
-            File subDir = new File(file, subfolder);
-            if (subDir.exists() && subDir.isDirectory()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void generateIndex(Long taskId) throws Exception {
