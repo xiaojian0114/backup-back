@@ -20,7 +20,7 @@ public class BackupTask {
     private String backupMode;
 
     @Column("status")
-    private String status;
+    private String status; // PENDING, RUNNING, PAUSED, COMPLETED, FAILED, CANCELED
 
     @Column("is_sensitive")
     private Boolean isSensitive;
@@ -28,7 +28,19 @@ public class BackupTask {
     @Column("backup_count")
     private Integer backupCount;
 
+    @Column("paused")
+    private boolean paused;
 
+    @Column("target_disk_id")
+    private String targetDiskId;
+
+    @Column("total_size")
+    private long totalSize; // 新增：总文件大小
+
+    @Column("completed_size")
+    private long completedSize; // 新增：已完成文件大小
+
+    // Getters and Setters
     public Long getId() {
         return id;
     }
@@ -74,7 +86,7 @@ public class BackupTask {
     }
 
     public void setSensitive(Boolean sensitive) {
-        isSensitive = sensitive;
+        this.isSensitive = sensitive;
     }
 
     public Integer getBackupCount() {
@@ -83,5 +95,37 @@ public class BackupTask {
 
     public void setBackupCount(Integer backupCount) {
         this.backupCount = backupCount;
+    }
+
+    public boolean isPaused() {
+        return paused;
+    }
+
+    public void setPaused(boolean paused) {
+        this.paused = paused;
+    }
+
+    public String getTargetDiskId() {
+        return targetDiskId;
+    }
+
+    public void setTargetDiskId(String targetDiskId) {
+        this.targetDiskId = targetDiskId;
+    }
+
+    public long getTotalSize() {
+        return totalSize;
+    }
+
+    public void setTotalSize(long totalSize) {
+        this.totalSize = totalSize;
+    }
+
+    public long getCompletedSize() {
+        return completedSize;
+    }
+
+    public void setCompletedSize(long completedSize) {
+        this.completedSize = completedSize;
     }
 }

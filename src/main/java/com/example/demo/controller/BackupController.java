@@ -12,15 +12,13 @@ import com.example.demo.service.DiskManagementService;
 import com.example.demo.service.SearchService;
 import com.example.demo.util.CryptoUtil;
 import jcifs.smb.SmbException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.IOException;
-import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -65,7 +63,6 @@ public class BackupController {
 
     private String normalizePath(String path) {
         if (path == null) return "";
-
         path = path.replace("/", "\\");
         while (path.endsWith("\\") && path.length() > 3) {
             path = path.substring(0, path.length() - 1);
@@ -75,6 +72,7 @@ public class BackupController {
         }
         return path;
     }
+
     @PostMapping("/backup")
     @Transactional
     public ResponseResult<Long> startBackup(@RequestBody Map<String, String> request) {
@@ -87,7 +85,6 @@ public class BackupController {
         log.info("收到备份请求: sourcePath={}, targetDiskId={}, targetPath={}, backupMode={}",
                 sourcePath, targetDiskId, targetPath, backupMode);
 
-        // 参数校验
         if (sourcePath == null || targetDiskId == null || targetPath == null) {
             return ResponseResult.fail("源路径、目标磁盘或目标路径不能为空");
         }
@@ -97,13 +94,11 @@ public class BackupController {
             return ResponseResult.fail("源路径不存在: " + sourcePath);
         }
 
-        // 获取目标磁盘
         HardDisk targetDisk = backupService.getDiskRepository().findByDiskId(targetDiskId);
         if (targetDisk == null) {
             return ResponseResult.fail("目标磁盘不存在: " + targetDiskId);
         }
 
-        // 校验目标路径
         Path fullTargetPath = Paths.get(targetDisk.getMountPoint(), targetPath);
         try {
             if (!Files.exists(fullTargetPath)) {
@@ -121,7 +116,6 @@ public class BackupController {
             return ResponseResult.fail("目标路径处理失败: " + e.getMessage());
         }
 
-        // 创建并保存任务（核心：返回taskId）
         BackupTask task = new BackupTask();
         task.setSourcePath(sourcePath);
         task.setBackupMode(backupMode != null ? backupMode : "COPY");
@@ -129,65 +123,85 @@ public class BackupController {
         task.setBackupCount(1);
         task.setStatus("PENDING");
         task.setSchedule("");
+        task.setTargetDiskId(targetDiskId);
+        task.setPaused(false);
+        task.setTotalSize(0L); // 初始化
+        task.setCompletedSize(0L);
 
-        // 保存任务获取ID
         BackupTask savedTask = backupService.getTaskRepository().save(task);
         log.info("备份任务已创建: taskId={}", savedTask.getId());
 
-        // 异步执行备份（避免阻塞请求）
         new Thread(() -> {
             try {
-                task.setStatus("RUNNING");
-                backupService.getTaskRepository().save(task); // 更新状态为运行中
-                backupService.executeBackup(task, targetDisk); // 调用服务执行备份
-                task.setStatus("COMPLETED");
-                backupService.getTaskRepository().save(task); // 完成后更新状态
+                backupService.executeBackup(savedTask, targetDisk);
             } catch (Exception e) {
-                log.error("备份任务执行失败: taskId={}", task.getId(), e);
-                task.setStatus("FAILED");
-                backupService.getTaskRepository().save(task); // 失败后更新状态
+                log.error("备份任务执行失败: taskId={}", savedTask.getId(), e);
             }
         }).start();
 
-        // 返回任务ID给前端
         return ResponseResult.success(savedTask.getId(), "备份任务已启动（taskId=" + savedTask.getId() + "）");
     }
 
-    /**
-     * 查询备份进度（基于日志计算）
-     */
     @GetMapping("/backup/progress")
     public ResponseResult<Map<String, Object>> getBackupProgress(@RequestParam Long taskId) {
         try {
-            // 1. 校验任务是否存在
+            float progress = backupService.getProgress(taskId);
             BackupTask task = backupService.getTaskRepository().findById(taskId)
                     .orElseThrow(() -> new IllegalArgumentException("任务不存在: " + taskId));
-
-            // 2. 查日志计算进度（服务层逻辑已实现通过日志统计）
-            List<BackupLog> logs = backupService.getLogRepository().findAllByTaskId(taskId);
-            if (logs.isEmpty()) {
-                return ResponseResult.success(Map.of("progress", 0.0, "status", task.getStatus()));
-            }
-
-            // 3. 计算总大小和已传输大小（复用服务层逻辑）
-            long totalSize = 0;
-            long transferred = 0;
-            for (BackupLog log : logs) {
-                File targetFile = new File(log.getTargetPath());
-                totalSize += targetFile.exists() ? targetFile.length() : 0;
-                transferred += log.getTransferOffset();
-            }
-
-            // 4. 计算进度（避免除零）
-            double progress = totalSize > 0 ? (transferred * 100.0 / totalSize) : 0;
             Map<String, Object> result = new HashMap<>();
-            result.put("progress", Math.min(100.0, progress)); // 进度不超过100%
-            result.put("status", task.getStatus()); // 返回任务状态（RUNNING/COMPLETED等）
-
+            result.put("progress", Math.min(100.0, progress));
+            result.put("status", task.getStatus());
             return ResponseResult.success(result, "进度查询成功");
         } catch (Exception e) {
             log.error("获取备份进度失败: taskId={}", taskId, e);
             return ResponseResult.fail("获取进度失败: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/backup/pause")
+    public ResponseResult<String> pauseBackup(@RequestBody Map<String, Long> request) {
+        try {
+            Long taskId = request.get("taskId");
+            if (taskId == null) {
+                return ResponseResult.fail("任务ID不能为空");
+            }
+            backupService.pauseBackup(taskId);
+            return ResponseResult.success("备份任务已暂停");
+        } catch (Exception e) {
+            log.error("暂停备份失败: {}", e.getMessage(), e);
+            return ResponseResult.fail("暂停备份失败: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/backup/resume")
+    public ResponseResult<String> resumeBackup(@RequestBody Map<String, Long> request) {
+        try {
+            Long taskId = request.get("taskId");
+            if (taskId == null) {
+                return ResponseResult.fail("任务ID不能为空");
+            }
+            backupService.resumeBackup(taskId);
+            return ResponseResult.success("备份任务已继续");
+        } catch (Exception e) {
+            log.error("继续备份失败: {}", e.getMessage(), e);
+            return ResponseResult.fail("继续备份失败: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/backup/cancel")
+    public ResponseResult<String> cancelBackup(@RequestBody Map<String, Long> request) {
+        try {
+            Long taskId = request.get("taskId");
+            if (taskId == null) {
+                return ResponseResult.fail("任务ID不能为空");
+            }
+            BackupTask task = backupService.getTaskRepository().findById(taskId)
+                    .orElseThrow(() -> new IllegalArgumentException("任务不存在: " + taskId));
+            backupService.cancelBackup(task);
+            return ResponseResult.success("备份任务已取消");
+        } catch (Exception e) {
+            log.error("取消备份失败: {}", e.getMessage(), e);
+            return ResponseResult.fail("取消备份失败: " + e.getMessage());
         }
     }
 
@@ -274,7 +288,6 @@ public class BackupController {
         }
     }
 
-
     @GetMapping("/disk/scan")
     public ResponseResult<List<HardDisk>> scanDisks() {
         try {
@@ -353,5 +366,3 @@ public class BackupController {
         }
     }
 }
-
-//2
